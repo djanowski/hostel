@@ -12,7 +12,7 @@ import (
 // Returns the DNS server instance
 func StartDNSServer() *dns.Server {
 	dnsServer := &dns.Server{
-		Addr: ":53",
+		Addr: ":55353",
 		Net:  "udp",
 	}
 
@@ -45,6 +45,6 @@ func StartDNSServer() *dns.Server {
 			log.Printf("Failed to start DNS server: %v", err)
 		}
 	}()
-	
+
 	return dnsServer
 }
