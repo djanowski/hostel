@@ -11,7 +11,6 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
-	"log"
 	"math/big"
 	"net"
 	"net/http"
@@ -21,6 +20,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -35,7 +35,7 @@ type Project struct {
 }
 
 func main() {
-	log.Println("Starting hostel - local development proxy server")
+	println("Starting hostel - local development proxy server")
 
 	// Get the directory to scan (default to current directory)
 	scanDir := "."
@@ -45,69 +45,56 @@ func main() {
 
 	projects, err := detectProjects(scanDir)
 	if err != nil {
-		log.Fatalf("Failed to detect projects: %v", err)
+		fatal("Failed to detect projects: %v", err)
 	}
 
 	if len(projects) == 0 {
-		log.Fatalf("No projects found in the current directory")
+		fatal("No projects found in %s", scanDir)
 	}
 
 	certPath, keyPath := "hostel.crt", "hostel.key"
 	if !fileExists(certPath) || !fileExists(keyPath) {
-		log.Println("Generating TLS certificate...")
+		println("Generating TLS certificate...")
 		err = generateCertificate(certPath, keyPath)
 		if err != nil {
-			log.Fatalf("Failed to generate TLS certificate: %v", err)
+			fatal("Failed to generate TLS certificate: %v", err)
 		}
-		log.Println("TLS certificate generated successfully")
+		println("TLS certificate generated successfully")
 	}
 
-	// Setup signal handling
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Start DNS server
 	dnsServer := StartDNSServer()
 
-	// Verify DNS resolution is working properly
-	ips, err := net.LookupHost("foo.localhost")
-	if err != nil || len(ips) == 0 || ips[0] != "127.0.0.1" {
-		log.Fatalf("DNS resolution failed: 'foo.localhost' does not resolve to 127.0.0.1. Your DNS may be misconfigured. Error: %v", err)
-	}
-	log.Println("DNS resolution verified successfully")
-
-	// Start project servers
 	startProjects(projects)
 
-	// Create HTTP server but don't start it yet
 	server := setupProxy(projects, certPath, keyPath)
 
-	// Start HTTP server in a goroutine
 	go func() {
-		log.Println("Starting HTTPS proxy server on port 443...")
+		println("Starting HTTPS proxy server on port 443...")
 		if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTPS server error: %v", err)
+			fatal("HTTPS server error: %v", err)
 		}
 	}()
 
-	absPath, _ := filepath.Abs(certPath)
-	log.Println("If you encounter certificate errors, trust the certificate with:")
-	log.Printf("security add-trusted-cert -d -r trustRoot -k ~/Library/Keychains/login.keychain-db %s", absPath)
+	// absPath, _ := filepath.Abs(certPath)
+	// println("If you encounter certificate errors, trust the certificate with:")
+	// printf("security add-trusted-cert -d -r trustRoot -k ~/Library/Keychains/login.keychain-db %s", absPath)
 
-	// Wait for termination signal
 	sig := <-signalChan
-	// log.Printf("Received signal: %v, shutting down...", sig)
-	println("Shutting down")
+
+	println("Shutting down...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	if err := server.Shutdown(ctx); err != nil {
-		log.Printf("HTTP server shutdown error: %v", err)
+		printf("HTTP server shutdown error: %v", err)
 	}
 
 	if err := dnsServer.ShutdownContext(ctx); err != nil {
-		log.Printf("DNS server shutdown error: %v", err)
+		printf("DNS server shutdown error: %v", err)
 	}
 
 	for _, p := range projects {
@@ -150,39 +137,39 @@ func startProject(p *Project, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	cmd := exec.Command("npm", "run", "dev")
-	cmd.Env = append(os.Environ(), fmt.Sprintf("PORT=%d", p.Port))
+	cmd.Env = append(os.Environ(), fmt.Sprintf("PORT=%d", p.Port), "FORCE_COLOR=1")
 	cmd.Dir = p.Path
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		log.Printf("Failed to create stdout pipe for %s: %v", p.Name, err)
+		printf("Failed to create stdout pipe for %s: %v", p.Name, err)
 		return
 	}
 
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
-		log.Printf("Failed to create stderr pipe for %s: %v", p.Name, err)
+		printf("Failed to create stderr pipe for %s: %v", p.Name, err)
 		return
 	}
 
 	p.Cmd = cmd
 	err = cmd.Start()
 	if err != nil {
-		log.Printf("Failed to start server for %s: %v", p.Name, err)
+		printf("Failed to start server for %s: %v", p.Name, err)
 		return
 	}
 
 	go func() {
 		scanner := bufio.NewScanner(stdoutPipe)
 		for scanner.Scan() {
-			fmt.Printf("[%s] %s\n", p.Name, scanner.Text())
+			printf("[%s] %s", p.Name, cleanLogLine(scanner.Text()))
 		}
 	}()
 
 	go func() {
 		scanner := bufio.NewScanner(stderrPipe)
 		for scanner.Scan() {
-			fmt.Printf("[%s] %s\n", p.Name, scanner.Text())
+			printf("[%s] %s", p.Name, cleanLogLine(scanner.Text()))
 		}
 	}()
 
@@ -200,11 +187,10 @@ func startProject(p *Project, wg *sync.WaitGroup) {
 			if err == nil {
 				conn.Close()
 				serverReady = true
-				log.Printf("Server for %s is listening on port %d", p.Name, p.Port)
 				break
 			}
 		case <-timeout:
-			log.Printf("Error: %s failed to start on port %d within %d seconds", p.Name, p.Port, timeoutSeconds)
+			printf("Error: %s failed to start on port %d within %d seconds", p.Name, p.Port, timeoutSeconds)
 			// Attempt to terminate the process if it didn't start properly
 			if p.Cmd != nil && p.Cmd.Process != nil {
 				p.Cmd.Process.Kill()
@@ -231,12 +217,12 @@ func setupProxy(projects []Project, certPath, keyPath string) *http.Server {
 	for _, p := range projects {
 		targetURL, err := url.Parse(fmt.Sprintf("http://localhost:%d", p.Port))
 		if err != nil {
-			log.Printf("Failed to parse URL for project %s: %v", p.Name, err)
+			printf("Failed to parse URL for project %s: %v", p.Name, err)
 			continue
 		}
 
 		projectTargets[p.Name] = targetURL
-		log.Printf("https://%s.localhost → %s", p.Name, targetURL)
+		printf("https://%s.localhost → %s", p.Name, targetURL)
 	}
 
 	director := func(req *http.Request) {
@@ -257,7 +243,7 @@ func setupProxy(projects []Project, certPath, keyPath string) *http.Server {
 
 		target, exists := projectTargets[projectName]
 		if !exists {
-			log.Printf("No project found for host: %s (project: %s)", host, projectName)
+			printf("No project found for host: %s (project: %s)", host, projectName)
 			return
 		}
 
@@ -276,7 +262,7 @@ func setupProxy(projects []Project, certPath, keyPath string) *http.Server {
 
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
-		log.Fatalf("Failed to load TLS certificate: %v", err)
+		fatal("Failed to load TLS certificate: %v", err)
 	}
 
 	tlsConfig := &tls.Config{
@@ -307,7 +293,7 @@ func generateCertificate(certPath, keyPath string) error {
 	}
 
 	dnsNames := []string{"*.localhost", "localhost", "*.*.localhost"}
-	log.Printf("Creating wildcard certificate for *.localhost and *.*.localhost")
+	printf("Creating wildcard certificate for *.localhost and *.*.localhost")
 
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
@@ -369,4 +355,50 @@ func singleJoiningSlash(a, b string) string {
 		return a + "/" + b
 	}
 	return a + b
+}
+
+func fatal(message string, args ...any) {
+	if len(args) > 0 {
+		message = fmt.Sprintf(message+": %s", args...)
+	}
+	println(message)
+	os.Exit(1)
+}
+
+func printf(format string, args ...any) {
+	fmt.Printf(format+"\n", args...)
+}
+
+func cleanLogLine(str string) string {
+	// Keep color codes (SGR - Select Graphic Rendition) which use the 'm' terminator
+	// but filter out other ANSI escape sequences
+
+	// This regex matches non-color ANSI sequences:
+	// - Cursor movement (A, B, C, D, E, F, G, H)
+	// - Clear screen/line (J, K)
+	// - Scrolling (S, T)
+	// - Cursor position save/restore (s, u)
+	// - And others that don't end with 'm'
+	nonColorRe := regexp.MustCompile(`\x1B\[[0-9;]*[ABCDEFGHJKSTsuhl]`)
+	str = nonColorRe.ReplaceAllString(str, "")
+
+	// Filter out OSC (Operating System Command) sequences
+	// These often look like \x1B]0;Some terminal title\x07
+	oscRe := regexp.MustCompile(`\x1B\][0-9].*?(\x07|\x1B\\)`)
+	str = oscRe.ReplaceAllString(str, "")
+
+	// Remove any other control characters that might cause issues
+	// but keep tabs, newlines, carriage returns, and ESC (for color codes)
+	clean := make([]rune, 0, len(str))
+	for _, r := range str {
+		// Keep:
+		// - Printable characters (r >= 32)
+		// - Tab (9), Newline (10), Carriage return (13)
+		// - ESC (27) for ANSI color sequences
+		if r >= 32 || r == '\t' || r == '\n' || r == '\r' || r == 27 {
+			clean = append(clean, r)
+		}
+	}
+
+	return string(clean)
 }

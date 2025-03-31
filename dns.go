@@ -2,7 +2,6 @@
 package main
 
 import (
-	"log"
 	"net"
 
 	"github.com/miekg/dns"
@@ -44,9 +43,21 @@ func StartDNSServer() *dns.Server {
 
 	go func() {
 		if err := dnsServer.ListenAndServe(); err != nil {
-			log.Printf("Failed to start DNS server: %v", err)
+			fatal("Failed to start DNS server: %v", err)
 		}
 	}()
+
+	ips, err := net.LookupHost("foobar.localhost")
+
+	if err != nil || len(ips) == 0 || ips[0] != "127.0.0.1" {
+		fatal(`
+DNS problem: *.localhost does not seem to resolve to 127.0.0.1.
+
+You may be able to fix this by running:
+
+	$ sudo mkdir -p /etc/resolver && echo -e "nameserver 127.0.0.1\nport 55353" | sudo tee /etc/resolver/localhost
+`)
+	}
 
 	return dnsServer
 }
