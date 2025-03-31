@@ -69,6 +69,13 @@ func main() {
 	// Start DNS server
 	dnsServer := StartDNSServer()
 
+	// Verify DNS resolution is working properly
+	ips, err := net.LookupHost("foo.localhost")
+	if err != nil || len(ips) == 0 || ips[0] != "127.0.0.1" {
+		log.Fatalf("DNS resolution failed: 'foo.localhost' does not resolve to 127.0.0.1. Your DNS may be misconfigured. Error: %v", err)
+	}
+	log.Println("DNS resolution verified successfully")
+
 	// Start project servers
 	startProjects(projects)
 

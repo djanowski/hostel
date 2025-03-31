@@ -8,11 +8,13 @@ import (
 	"github.com/miekg/dns"
 )
 
+var port = "55353"
+
 // StartDNSServer starts a DNS server that responds to all queries with 127.0.0.1
 // Returns the DNS server instance
 func StartDNSServer() *dns.Server {
 	dnsServer := &dns.Server{
-		Addr: ":55353",
+		Addr: ":" + port,
 		Net:  "udp",
 	}
 
