@@ -1,5 +1,6 @@
-*.crt
-*.key
-.local/
-dist/
-servers/
+/*.crt
+/*.key
+/.local/
+/dist/
+/servers/
+/hostel

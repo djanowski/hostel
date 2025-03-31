@@ -4,4 +4,4 @@ build:
 	go build .
 
 release:
-	goreleaser release
+	goreleaser release --clean
