@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"flag"
 	"fmt"
 	"math/big"
 	"net"
@@ -25,6 +26,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/miekg/dns"
 )
 
 type Project struct {
@@ -45,11 +48,18 @@ func main() {
 A simple reverse proxy for local development
 `)
 
+	// Define CLI flags
+	domainFlag := flag.String("domain", "localhost", "Custom domain to use for projects (default: localhost)")
+	flag.Parse()
+
 	// Get the directory to scan (default to current directory)
+	args := flag.Args()
 	scanDir := "."
-	if len(os.Args) > 1 {
-		scanDir = os.Args[1]
+	if len(args) > 0 {
+		scanDir = args[0]
 	}
+
+	domain := *domainFlag
 
 	projects, err := detectProjects(scanDir)
 	if err != nil {
@@ -60,10 +70,10 @@ A simple reverse proxy for local development
 		fatal("No projects found in %s", scanDir)
 	}
 
-	certPath, keyPath := "hostel.crt", "hostel.key"
+	certPath, keyPath := domain+".crt", domain+".key"
 	if !fileExists(certPath) || !fileExists(keyPath) {
 		println("Generating TLS certificate...")
-		err = generateCertificate(certPath, keyPath)
+		err = generateCertificate(certPath, keyPath, domain)
 		if err != nil {
 			fatal("Failed to generate TLS certificate: %v", err)
 		}
@@ -73,11 +83,14 @@ A simple reverse proxy for local development
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
 
-	dnsServer := StartDNSServer()
+	var dnsServer *dns.Server
+	if domain == "localhost" {
+		dnsServer = StartDNSServer()
+	}
 
 	startProjects(projects)
 
-	server := setupProxy(projects, certPath, keyPath)
+	server := setupProxy(projects, certPath, keyPath, domain)
 
 	go func() {
 		println("Starting HTTPS proxy server on port 443...")
@@ -101,8 +114,10 @@ A simple reverse proxy for local development
 		printf("HTTP server shutdown error: %v", err)
 	}
 
-	if err := dnsServer.ShutdownContext(ctx); err != nil {
-		printf("DNS server shutdown error: %v", err)
+	if dnsServer != nil {
+		if err := dnsServer.ShutdownContext(ctx); err != nil {
+			printf("DNS server shutdown error: %v", err)
+		}
 	}
 
 	for _, p := range projects {
@@ -219,7 +234,7 @@ func startProjects(projects []Project) {
 	wg.Wait()
 }
 
-func setupProxy(projects []Project, certPath, keyPath string) *http.Server {
+func setupProxy(projects []Project, certPath, keyPath, domain string) *http.Server {
 	projectTargets := make(map[string]*url.URL)
 
 	for _, p := range projects {
@@ -230,7 +245,7 @@ func setupProxy(projects []Project, certPath, keyPath string) *http.Server {
 		}
 
 		projectTargets[p.Name] = targetURL
-		printf("https://%s.localhost → %s", p.Name, targetURL)
+		printf("https://%s.%s → %s", p.Name, domain, targetURL)
 	}
 
 	director := func(req *http.Request) {
@@ -240,14 +255,10 @@ func setupProxy(projects []Project, certPath, keyPath string) *http.Server {
 			host = strings.Split(host, ":")[0]
 		}
 
-		// Extract project name from hostname
-		// This will match both project.localhost and any subdomain.project.localhost
-		parts := strings.Split(host, ".")
 		var projectName string
 
-		if len(parts) >= 2 && parts[len(parts)-1] == "localhost" {
-			projectName = parts[len(parts)-2]
-		}
+		parts := strings.Split(strings.TrimSuffix(host, "."+domain), ".")
+		projectName = parts[len(parts)-1]
 
 		target, exists := projectTargets[projectName]
 		if !exists {
@@ -286,7 +297,7 @@ func setupProxy(projects []Project, certPath, keyPath string) *http.Server {
 	return server
 }
 
-func generateCertificate(certPath, keyPath string) error {
+func generateCertificate(certPath, keyPath, domain string) error {
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return err
@@ -300,14 +311,19 @@ func generateCertificate(certPath, keyPath string) error {
 		return err
 	}
 
-	dnsNames := []string{"*.localhost", "localhost", "*.*.localhost"}
-	printf("Creating wildcard certificate for *.localhost and *.*.localhost")
+	// Create DNS names for the certificate based on the domain
+	dnsNames := []string{
+		fmt.Sprintf("*.%s", domain),
+		domain,
+		fmt.Sprintf("*.*.%s", domain),
+	}
+	printf("Creating wildcard certificate for *.%s and *.*.%s", domain, domain)
 
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			Organization: []string{"Hostel Local Development"},
-			CommonName:   "*.localhost",
+			CommonName:   fmt.Sprintf("*.%s", domain),
 		},
 		NotBefore:             notBefore,
 		NotAfter:              notAfter,
