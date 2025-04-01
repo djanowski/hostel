@@ -35,7 +35,15 @@ type Project struct {
 }
 
 func main() {
-	println("Starting hostel - local development proxy server")
+	println(`
+ _               _       _
+| |__   ___  ___| |_ ___| |
+| '_ \ / _ \/ __| __/ _ \ |
+| | | | (_) \__ \ ||  __/ |
+|_| |_|\___/|___/\__\___|_|
+
+A simple reverse proxy for local development
+`)
 
 	// Get the directory to scan (default to current directory)
 	scanDir := "."
