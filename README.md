@@ -39,3 +39,8 @@ More installation options coming soon.
 - Support for other project types using `Procfile.dev`
 - Explore options to remove the need for `/etc/resolvers`
 - Automatically start and stop the web server based on usage
+
+## Inspiration
+
+We used [Hotel](https://github.com/typicode/hotel) (and then [Chalet](https://github.com/jeansaad/chalet))
+for a few years before they got abandoned.
