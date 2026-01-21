@@ -3,6 +3,7 @@ package main
 
 import (
 	"net"
+	"slices"
 
 	"github.com/miekg/dns"
 )
@@ -49,7 +50,7 @@ func StartDNSServer() *dns.Server {
 
 	ips, err := net.LookupHost("foobar.localhost")
 
-	if err != nil || len(ips) == 0 || ips[0] != "127.0.0.1" {
+	if err != nil || !slices.Contains(ips, "127.0.0.1") {
 		fatal(`
 DNS problem: *.localhost does not seem to resolve to 127.0.0.1.
 

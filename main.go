@@ -37,6 +37,10 @@ type Project struct {
 	Cmd  *exec.Cmd
 }
 
+func setTerminalTitle(title string) {
+	fmt.Printf("\033]0;%s\007", title)
+}
+
 func main() {
 	println(`
  _               _       _
@@ -47,6 +51,8 @@ func main() {
 
 A simple reverse proxy for local development
 `)
+
+	setTerminalTitle("hostel")
 
 	// Define CLI flags
 	domainFlag := flag.String("domain", "localhost", "Custom domain to use for projects (default: localhost)")
@@ -156,11 +162,40 @@ func detectProjects(dir string) ([]Project, error) {
 	return projects, nil
 }
 
+func hasDevTarget(projectPath string) bool {
+	makefilePath := filepath.Join(projectPath, "Makefile")
+	if !fileExists(makefilePath) {
+		return false
+	}
+
+	file, err := os.Open(makefilePath)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "dev:") {
+			return true
+		}
+	}
+
+	return false
+}
+
 func startProject(p *Project, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	cmd := exec.Command("npm", "run", "dev")
-	cmd.Env = append(os.Environ(), fmt.Sprintf("PORT=%d", p.Port), "FORCE_COLOR=1")
+	var cmd *exec.Cmd
+	if hasDevTarget(p.Path) {
+		cmd = exec.Command("make", "dev")
+		cmd.Env = append(os.Environ(), fmt.Sprintf("PORT=%d", p.Port), "FORCE_COLOR=1")
+	} else {
+		cmd = exec.Command("npm", "run", "dev")
+		cmd.Env = append(os.Environ(), fmt.Sprintf("PORT=%d", p.Port), "FORCE_COLOR=1")
+	}
 	cmd.Dir = p.Path
 
 	stdoutPipe, err := cmd.StdoutPipe()
@@ -185,14 +220,14 @@ func startProject(p *Project, wg *sync.WaitGroup) {
 	go func() {
 		scanner := bufio.NewScanner(stdoutPipe)
 		for scanner.Scan() {
-			printf("[%s] %s", p.Name, cleanLogLine(scanner.Text()))
+			printf("[%s:%d] %s", p.Name, p.Port, cleanLogLine(scanner.Text()))
 		}
 	}()
 
 	go func() {
 		scanner := bufio.NewScanner(stderrPipe)
 		for scanner.Scan() {
-			printf("[%s] %s", p.Name, cleanLogLine(scanner.Text()))
+			printf("[%s:%d] %s", p.Name, p.Port, cleanLogLine(scanner.Text()))
 		}
 	}()
 
