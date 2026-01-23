@@ -2,7 +2,11 @@ module github.com/djanowski/hostel
 
 go 1.23.5
 
-require github.com/miekg/dns v1.1.64
+require (
+	github.com/BurntSushi/toml v1.3.2
+	github.com/fsnotify/fsnotify v1.7.0
+	github.com/miekg/dns v1.1.64
+)
 
 require (
 	golang.org/x/mod v0.23.0 // indirect

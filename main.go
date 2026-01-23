@@ -27,7 +27,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/miekg/dns"
+	"github.com/fsnotify/fsnotify"
 )
 
 type Project struct {
@@ -37,11 +37,142 @@ type Project struct {
 	Cmd  *exec.Cmd
 }
 
+type ProxyTargets struct {
+	sync.RWMutex
+	targets map[string]*url.URL
+}
+
+func (pt *ProxyTargets) Get(name string) (*url.URL, bool) {
+	pt.RLock()
+	defer pt.RUnlock()
+	target, ok := pt.targets[name]
+	return target, ok
+}
+
+func (pt *ProxyTargets) Update(projects []Project, domain string) {
+	pt.Lock()
+	defer pt.Unlock()
+	pt.targets = make(map[string]*url.URL)
+	for _, p := range projects {
+		targetURL, err := url.Parse(fmt.Sprintf("http://localhost:%d", p.Port))
+		if err != nil {
+			printf("Failed to parse URL for project %s: %v", p.Name, err)
+			continue
+		}
+		pt.targets[p.Name] = targetURL
+		printf("https://%s.%s → %s", p.Name, domain, targetURL)
+	}
+}
+
+type ServiceRegistry struct {
+	sync.RWMutex
+	services map[string]bool
+}
+
+func (r *ServiceRegistry) Has(name string) bool {
+	r.RLock()
+	defer r.RUnlock()
+	_, exists := r.services[name]
+	return exists
+}
+
+func (r *ServiceRegistry) Update(config Config) {
+	r.Lock()
+	defer r.Unlock()
+	r.services = make(map[string]bool)
+	for name := range config {
+		r.services[name] = true
+	}
+}
+
+func stopProjects(projects []Project) {
+	for _, p := range projects {
+		if p.Cmd != nil && p.Cmd.Process != nil {
+			syscall.Kill(-p.Cmd.Process.Pid, syscall.SIGTERM)
+			p.Cmd.Wait()
+		}
+	}
+}
+
 func setTerminalTitle(title string) {
 	fmt.Printf("\033]0;%s\007", title)
 }
 
 func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "add":
+			handleAddCommand(os.Args[2:])
+			return
+		case "help", "--help", "-h":
+			printUsage()
+			return
+		}
+	}
+
+	runDaemon()
+}
+
+func printUsage() {
+	fmt.Println(`hostel - A simple reverse proxy for local development
+
+Usage:
+    hostel              Start the proxy server
+    hostel add [name]   Add current directory to config
+                        Uses directory name if [name] not provided
+
+Options:
+    -domain string      Custom domain to use (default: hostel.dev)
+    -h, --help          Show this help message
+
+Config file: ~/.config/hostel/config.toml`)
+}
+
+func handleAddCommand(args []string) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		fatal("Failed to get current directory: %v", err)
+	}
+
+	var serviceName string
+	if len(args) > 0 && args[0] != "" {
+		serviceName = args[0]
+	} else {
+		serviceName = filepath.Base(cwd)
+	}
+
+	if !isValidServiceName(serviceName) {
+		fatal("Invalid service name '%s'. Use only letters, numbers, hyphens, and underscores.", serviceName)
+	}
+
+	config, err := loadConfig()
+	if err != nil {
+		fatal("Failed to load config: %v", err)
+	}
+
+	if existing, exists := config[serviceName]; exists {
+		if existing.Path == cwd {
+			printf("Service '%s' already configured with path %s", serviceName, cwd)
+			return
+		}
+		fatal("Service '%s' already exists with path: %s\nUse a different name or remove the existing entry.", serviceName, existing.Path)
+	}
+
+	config[serviceName] = ServiceConfig{
+		Path: cwd,
+	}
+
+	if err := saveConfig(config); err != nil {
+		fatal("Failed to save config: %v", err)
+	}
+
+	printf("Added '%s' -> %s", serviceName, cwd)
+
+	path, _ := configPath()
+	printf("Config saved to %s", path)
+}
+
+func runDaemon() {
 	println(`
  _               _       _
 | |__   ___  ___| |_ ___| |
@@ -54,29 +185,30 @@ A simple reverse proxy for local development
 
 	setTerminalTitle("hostel")
 
-	// Define CLI flags
-	domainFlag := flag.String("domain", "localhost", "Custom domain to use for projects (default: localhost)")
+	domainFlag := flag.String("domain", "hostel.dev", "Custom domain to use for projects")
 	flag.Parse()
-
-	// Get the directory to scan (default to current directory)
-	args := flag.Args()
-	scanDir := "."
-	if len(args) > 0 {
-		scanDir = args[0]
-	}
 
 	domain := *domainFlag
 
-	projects, err := detectProjects(scanDir)
+	config, err := loadConfig()
 	if err != nil {
-		fatal("Failed to detect projects: %v", err)
+		fatal("Failed to load config: %v", err)
 	}
 
-	if len(projects) == 0 {
-		fatal("No projects found in %s", scanDir)
+	if len(config) == 0 {
+		path, _ := configPath()
+		fatal("No services configured.\n\nAdd services with:\n    cd /path/to/project && hostel add\n\nOr manually edit: %s", path)
 	}
 
-	certPath, keyPath := domain+".crt", domain+".key"
+	if err := validateConfig(config); err != nil {
+		fatal("Config error: %v", err)
+	}
+
+	projects := configToProjects(config)
+
+	configDir, _ := configPath()
+	configDir = filepath.Dir(configDir)
+	certPath, keyPath := filepath.Join(configDir, domain+".crt"), filepath.Join(configDir, domain+".key")
 	if !fileExists(certPath) || !fileExists(keyPath) {
 		println("Generating TLS certificate...")
 		err = generateCertificate(certPath, keyPath, domain)
@@ -89,14 +221,16 @@ A simple reverse proxy for local development
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
 
-	var dnsServer *dns.Server
-	if domain == "localhost" {
-		dnsServer = StartDNSServer()
-	}
+	serviceRegistry := &ServiceRegistry{services: make(map[string]bool)}
+	serviceRegistry.Update(config)
 
-	startProjects(projects)
+	dnsServer := StartDNSServer(domain, serviceRegistry.Has)
 
-	server := setupProxy(projects, certPath, keyPath, domain)
+	proxyTargets := &ProxyTargets{targets: make(map[string]*url.URL)}
+	proxyTargets.Update(projects, domain)
+	startProjects(projects, domain)
+
+	server := setupProxy(proxyTargets, certPath, keyPath, domain)
 
 	go func() {
 		println("Starting HTTPS proxy server on port 443...")
@@ -105,61 +239,98 @@ A simple reverse proxy for local development
 		}
 	}()
 
-	// absPath, _ := filepath.Abs(certPath)
-	// println("If you encounter certificate errors, trust the certificate with:")
-	// printf("security add-trusted-cert -d -r trustRoot -k ~/Library/Keychains/login.keychain-db %s", absPath)
+	reloadChan := make(chan bool, 1)
+	go watchConfig(reloadChan)
 
-	sig := <-signalChan
+	for {
+		select {
+		case <-reloadChan:
+			println("Config changed, reloading...")
+			stopProjects(projects)
 
-	println("Shutting down...")
+			config, err = loadConfig()
+			if err != nil {
+				printf("Failed to reload config: %v", err)
+				continue
+			}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+			if err := validateConfig(config); err != nil {
+				printf("Config error: %v", err)
+				continue
+			}
 
-	if err := server.Shutdown(ctx); err != nil {
-		printf("HTTP server shutdown error: %v", err)
-	}
+			projects = configToProjects(config)
+			serviceRegistry.Update(config)
+			proxyTargets.Update(projects, domain)
+			startProjects(projects, domain)
+			println("Reload complete")
 
-	if dnsServer != nil {
-		if err := dnsServer.ShutdownContext(ctx); err != nil {
-			printf("DNS server shutdown error: %v", err)
-		}
-	}
+		case sig := <-signalChan:
+			println("Shutting down...")
 
-	for _, p := range projects {
-		if p.Cmd != nil && p.Cmd.Process != nil {
-			p.Cmd.Process.Signal(sig)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+			if err := server.Shutdown(ctx); err != nil {
+				printf("HTTP server shutdown error: %v", err)
+			}
+
+			if dnsServer != nil {
+				if err := dnsServer.ShutdownContext(ctx); err != nil {
+					printf("DNS server shutdown error: %v", err)
+				}
+			}
+
+			for _, p := range projects {
+				if p.Cmd != nil && p.Cmd.Process != nil {
+					p.Cmd.Process.Signal(sig)
+				}
+			}
+
+			cancel()
+			return
 		}
 	}
 }
 
-func detectProjects(dir string) ([]Project, error) {
-	var projects []Project
-	basePort := 8000
-
-	entries, err := os.ReadDir(dir)
+func watchConfig(reloadChan chan<- bool) {
+	path, err := configPath()
 	if err != nil {
-		return nil, fmt.Errorf("failed to read directory %s: %v", dir, err)
+		printf("Failed to get config path for watcher: %v", err)
+		return
 	}
 
-	for i, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		printf("Failed to create file watcher: %v", err)
+		return
+	}
+	defer watcher.Close()
 
-		projectPath := filepath.Join(dir, entry.Name())
-		gitPath := filepath.Join(projectPath, ".git")
-
-		if _, err := os.Stat(gitPath); err == nil {
-			projects = append(projects, Project{
-				Name: entry.Name(),
-				Path: projectPath,
-				Port: basePort + i,
-			})
-		}
+	dir := filepath.Dir(path)
+	if err := watcher.Add(dir); err != nil {
+		printf("Failed to watch config directory: %v", err)
+		return
 	}
 
-	return projects, nil
+	for {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			if event.Name == path && (event.Op&fsnotify.Write != 0 || event.Op&fsnotify.Create != 0) {
+				select {
+				case reloadChan <- true:
+				default:
+				}
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			printf("File watcher error: %v", err)
+		}
+	}
 }
 
 func hasDevTarget(projectPath string) bool {
@@ -185,18 +356,26 @@ func hasDevTarget(projectPath string) bool {
 	return false
 }
 
-func startProject(p *Project, wg *sync.WaitGroup) {
+func startProject(p *Project, domain string, wg *sync.WaitGroup) {
 	defer wg.Done()
+
+	host := fmt.Sprintf("%s.%s", p.Name, domain)
+	env := append(os.Environ(),
+		fmt.Sprintf("PORT=%d", p.Port),
+		fmt.Sprintf("__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=%s", host),
+		"FORCE_COLOR=1",
+	)
 
 	var cmd *exec.Cmd
 	if hasDevTarget(p.Path) {
 		cmd = exec.Command("make", "dev")
-		cmd.Env = append(os.Environ(), fmt.Sprintf("PORT=%d", p.Port), "FORCE_COLOR=1")
+		cmd.Env = env
 	} else {
 		cmd = exec.Command("npm", "run", "dev")
-		cmd.Env = append(os.Environ(), fmt.Sprintf("PORT=%d", p.Port), "FORCE_COLOR=1")
+		cmd.Env = env
 	}
 	cmd.Dir = p.Path
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -249,40 +428,27 @@ func startProject(p *Project, wg *sync.WaitGroup) {
 			}
 		case <-timeout:
 			printf("Error: %s failed to start on port %d within %d seconds", p.Name, p.Port, timeoutSeconds)
-			// Attempt to terminate the process if it didn't start properly
+			// Kill entire process group
 			if p.Cmd != nil && p.Cmd.Process != nil {
-				p.Cmd.Process.Kill()
+				syscall.Kill(-p.Cmd.Process.Pid, syscall.SIGTERM)
 			}
 			return
 		}
 	}
 }
 
-func startProjects(projects []Project) {
+func startProjects(projects []Project, domain string) {
 	var wg sync.WaitGroup
 
 	for i := range projects {
 		wg.Add(1)
-		go startProject(&projects[i], &wg)
+		go startProject(&projects[i], domain, &wg)
 	}
 
 	wg.Wait()
 }
 
-func setupProxy(projects []Project, certPath, keyPath, domain string) *http.Server {
-	projectTargets := make(map[string]*url.URL)
-
-	for _, p := range projects {
-		targetURL, err := url.Parse(fmt.Sprintf("http://localhost:%d", p.Port))
-		if err != nil {
-			printf("Failed to parse URL for project %s: %v", p.Name, err)
-			continue
-		}
-
-		projectTargets[p.Name] = targetURL
-		printf("https://%s.%s → %s", p.Name, domain, targetURL)
-	}
-
+func setupProxy(proxyTargets *ProxyTargets, certPath, keyPath, domain string) *http.Server {
 	director := func(req *http.Request) {
 		host := req.Host
 
@@ -290,12 +456,10 @@ func setupProxy(projects []Project, certPath, keyPath, domain string) *http.Serv
 			host = strings.Split(host, ":")[0]
 		}
 
-		var projectName string
-
 		parts := strings.Split(strings.TrimSuffix(host, "."+domain), ".")
-		projectName = parts[len(parts)-1]
+		projectName := parts[len(parts)-1]
 
-		target, exists := projectTargets[projectName]
+		target, exists := proxyTargets.Get(projectName)
 		if !exists {
 			printf("No project found for host: %s (project: %s)", host, projectName)
 			return
@@ -416,11 +580,8 @@ func singleJoiningSlash(a, b string) string {
 	return a + b
 }
 
-func fatal(message string, args ...any) {
-	if len(args) > 0 {
-		message = fmt.Sprintf(message+": %s", args...)
-	}
-	println(message)
+func fatal(format string, args ...any) {
+	fmt.Printf(format+"\n", args...)
 	os.Exit(1)
 }
 
